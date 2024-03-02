@@ -6,13 +6,14 @@ import ray
 import time
 import heapq
 import torch
+import random
 from lean_dojo import (
     Pos,
     Dojo,
     Theorem,
     LeanGitRepo,
     TacticState,
-    TacticError,
+    LeanError,
     TimeoutError,
     ProofFinished,
     ProofGivenUp,
@@ -47,6 +48,265 @@ class SearchResult:
     num_total_nodes: int
     num_searched_nodes: int
 
+class MCTSProver:
+    def __init__(
+        self,
+        tac_gen,  # A given tactic generator.
+        timeout: int,
+        num_sampled_tactics: int,
+        debug: bool,
+    ) -> None:
+        self.tac_gen = tac_gen
+        self.timeout = timeout
+        self.num_sampled_tactics = num_sampled_tactics
+        self.debug = debug
+
+        self.num_expansions = 0
+        self.actor_time = 0.0
+        self.environment_time = 0.0
+        self.total_time = None
+
+    def search(
+        self, repo: LeanGitRepo, thm: Theorem, pos: Pos
+    ) -> Optional[SearchResult]:
+        logger.info(f"MCTS Proving {thm}")
+
+        self.repo = repo
+        self.theorem = thm
+        self.posision = pos
+        self.actor_time = 0.0
+        self.environment_time = 0.0
+        self.num_expansions = 0
+
+        try:
+            logger.info(f"Trying to build dojo")
+            with Dojo(thm, hard_timeout=60 + self.timeout) as (dojo, init_state):
+                logger.info(f"successfully built dojo")
+                self.dojo = dojo
+                self.root = InternalNode(
+                    state=init_state,
+                    cumulative_logprob=0.0,
+                )
+                self.nodes = {init_state: self.root}
+                self.current_root = self.root
+
+                with torch.no_grad():
+                    try:
+                        self._mcts()
+                    except DojoCrashError:
+                        logger.warning(f"Dojo crashed when proving {thm}")
+                        pass
+
+            if self.root.status == Status.PROVED:
+                proof = [e.tactic for e in self.root.extract_proof()]
+            else:
+                proof = None
+
+            result = SearchResult(
+                theorem=thm,
+                status=self.root.status,
+                proof=proof,
+                tree=self.root,
+                actor_time=self.actor_time,
+                environment_time=self.environment_time,
+                total_time=self.total_time,
+                num_total_nodes=len(self.nodes),
+                num_searched_nodes=self.num_expansions,
+            )
+            logger.info(result)
+            return result
+
+        except DojoInitError as ex:
+            logger.warning(ex)
+            return None
+
+    def _mcts(self) -> None:
+        time_start = time.monotonic()
+
+        while True:
+            logger.info("trying")
+            try:
+                self._step()
+            except DojoHardTimeoutError:
+                assert time.monotonic() - time_start >= self.timeout
+
+            self.total_time = time.monotonic() - time_start
+            if self.total_time > self.timeout:
+                if self.root.status == Status.PROVED:
+                    logger.info("Found a proof but timed out.")
+                self.root.status = Status.OPEN
+                logger.info("Search timed out.")
+                break
+
+            if self.root.status == Status.FAILED:
+                logger.info("Failed early!")
+                break
+
+            if self.root.status == Status.PROVED:
+                logger.info("Found a proof!")
+                break
+
+    def _select(self):
+        node = self.root
+        while node.is_explored:
+            node = random.choice(node.out_edges).dst
+            if isinstance(node, ErrorNode):
+                node = self.root
+        return node
+        
+    def _step(self):
+        """
+        Performs a single round of MCTS.
+        https://en.wikipedia.org/wiki/Monte_Carlo_tree_search
+
+        1. Starting at the root, select succesive children until a leaf node, L, is reached.
+            leaf node := node from which no playout has been initiated.
+
+        2. Unless theorem is proved or there are no possible tactics from this state, create new child nodes. Choose node C.
+
+        3. Complete one random playout from node C.
+
+        4. Update information in nodes along path from root to C.
+        """
+        # Search the node with highest priority.
+        # search_node = heapq.heappop(self.priority_queue)
+        logger.info(f"Root: {self.root}")
+        search_node = self._select()
+        logger.info(f"Expanding node: {search_node}")
+
+        # if self.debug:
+        #     assert all(
+        #         search_node.priority >= node.priority for node in self.priority_queue
+        #     )
+
+        if isinstance(search_node.state, TacticState):
+            ts = search_node.state.pp
+        else:
+            ts = search_node.state.unsolved_tactic_state
+        suggestions = self._generate_tactics(ts)
+
+        # Try all tactics in order of descending logprob, and collect the results. Any
+        # new nodes are added to `self.nodes`, and edges are added to the result node.
+        results = [
+            self._run_tactic(search_node, tactic, logprob)
+            for tactic, logprob in suggestions
+        ]
+
+        # Store the fixed out edges of this node, marking it as explored.
+        # This will trigger recursively recomputing tree statistics.
+        search_node.out_edges = results
+        self.num_expansions += 1
+
+        # If we're running in debug mode, run a full test suite each step
+        if self.debug:
+            assert self.num_expansions == sum(
+                node.is_explored
+                for node in self.nodes.values()
+                if isinstance(node, InternalNode)
+            )
+            self.check_invariants()
+
+    def _generate_tactics(self, ts: str) -> List[Tuple[str, float]]:
+        t0 = time.monotonic()
+
+        path = str(self.theorem.file_path)
+
+        if self.theorem.repo != self.repo:
+            if self.theorem.repo.uses_lean3:
+                path = os.path.join(LEAN3_DEPS_DIR, self.theorem.repo.name, path)
+            elif self.theorem.repo.is_lean:
+                raise NotImplementedError
+                path = os.path.join(LEAN4_DEPS_DIR, "lean4", path)
+            else:
+                path = os.path.join(LEAN4_DEPS_DIR, self.theorem.repo.name, path)
+
+        suggestions = self.tac_gen.generate(
+            state=ts,
+            file_path=path,
+            theorem_full_name=self.theorem.full_name,
+            theorem_pos=self.posision,
+            num_samples=self.num_sampled_tactics,
+        )
+
+        self.actor_time += time.monotonic() - t0
+
+        logger.debug(f"Tactic suggestions: {suggestions}")
+        return suggestions
+
+    def _run_tactic(self, node: InternalNode, tactic: str, logprob: float) -> Edge:
+        t0 = time.monotonic()
+        response = self.dojo.run_tac(node.state, tactic)
+
+        elapsed = time.monotonic() - t0
+        self.environment_time += elapsed
+
+        try:
+            # If we've seen this response before, use the existing node
+            result_node = self.nodes[response]
+        except KeyError:
+            # Build a new node
+            if isinstance(response, ProofFinished):
+                result_node = ProofFinishedNode(response)
+            elif type(response) in (
+                LeanError,
+                TimeoutError,
+                ProofGivenUp,
+            ):
+                result_node = ErrorNode(response)
+            else:
+                assert isinstance(response, TacticState)
+                result_node = InternalNode(
+                    state=response,
+                    cumulative_logprob=logprob + node.cumulative_logprob,
+                )
+
+            # if result_node.status == Status.OPEN:  # Don't search proved/failed nodes
+            #     heapq.heappush(self.priority_queue, result_node)  # type: ignore
+
+        # Record the new node and add it to the search queue.
+        self.nodes[response] = result_node
+
+        # Build an edge connecting these nodes.
+        # Will be added to the source node externally.
+        edge = Edge(tactic=tactic, src=node, dst=result_node)
+
+        if isinstance(result_node, InternalNode):
+            result_node.in_edges.append(edge)
+
+        return edge
+
+    #########
+    # DEBUG #
+    #########
+
+    def check_invariants(self):
+        """Perform some sanity checks."""
+        for node in self.priority_queue:
+            assert node in self.nodes.values()
+            assert isinstance(node, InternalNode)
+            assert not node.is_explored
+
+        for response, node in self.nodes.items():
+            if isinstance(response, ProofFinished):
+                assert isinstance(node, ProofFinishedNode)
+                assert node not in self.priority_queue
+                assert self.root.status == Status.PROVED
+            elif type(response) in (
+                LeanError,
+                TimeoutError,
+                ProofGivenUp,
+            ):
+                assert isinstance(node, ErrorNode)
+                assert node not in self.priority_queue
+            else:
+                assert isinstance(node, InternalNode)
+
+                if node.is_explored:
+                    assert node not in self.priority_queue
+                else:
+                    assert node in self.priority_queue
+
+                node.check_invariants()
 
 class BestFirstSearchProver:
     """A prover that uses best-first search to find proofs using a tactic generator."""
@@ -235,7 +495,7 @@ class BestFirstSearchProver:
             if isinstance(response, ProofFinished):
                 result_node = ProofFinishedNode(response)
             elif type(response) in (
-                TacticError,
+                LeanError,
                 TimeoutError,
                 ProofGivenUp,
             ):
@@ -279,7 +539,7 @@ class BestFirstSearchProver:
                 assert node not in self.priority_queue
                 assert self.root.status == Status.PROVED
             elif type(response) in (
-                TacticError,
+                LeanError,
                 TimeoutError,
                 ProofGivenUp,
             ):
@@ -297,7 +557,7 @@ class BestFirstSearchProver:
 
 
 @ray.remote
-class CpuProver(BestFirstSearchProver):
+class CpuProver(MCTSProver):
     """Ray actor for running an instance of `BestFirstSearchProver` on a CPU."""
 
     def __init__(
@@ -324,7 +584,7 @@ class CpuProver(BestFirstSearchProver):
 
 
 @ray.remote(num_gpus=1)
-class GpuProver(BestFirstSearchProver):
+class GpuProver(MCTSProver):
     """Ray actor for running an instance of `BestFirstSearchProver` on a GPU."""
 
     def __init__(
@@ -376,14 +636,22 @@ class DistributedProver:
             if tac_gen.retriever is not None:
                 assert indexed_corpus_path is not None
                 tac_gen.retriever.load_corpus(indexed_corpus_path)
-            self.prover = BestFirstSearchProver(
-                tac_gen, timeout, num_sampled_tactics, debug
-            )
+            mcts= True
+            if mcts:
+                self.prover = MCTSProver(
+                    tac_gen, timeout, num_sampled_tactics, debug
+                )
+            else:
+                self.prover = BestFirstSearchProver(
+                    tac_gen, timeout, num_sampled_tactics, debug
+                )
+
             return
 
         if with_gpus:
-            logger.info(f"Launching {num_cpus} GPU workers.")
-            ray.init(num_cpus=num_cpus, num_gpus=num_cpus)
+            num_gpus = num_cpus
+            logger.info(f"Launching {num_gpus} GPU workers.")
+            ray.init(num_cpus=num_cpus, num_gpus=num_gpus)
             provers = [
                 GpuProver.remote(
                     ckpt_path,

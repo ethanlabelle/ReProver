@@ -3,7 +3,7 @@ from glob import glob
 
 
 for filename in glob(sys.argv[1]):
-    print(filename)
+    print(filename.split("/")[3].split("_random_premises")[0])
     num_total = num_correct = 0
     for line in open(filename):
         if "SearchResult" in line:
