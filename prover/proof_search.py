@@ -306,6 +306,68 @@ class MCTSProver:
 
                 node.check_invariants()
 
+@ray.remote
+class CpuProver(MCTSProver):
+    """Ray actor for running an instance of `MCTSProver` on a CPU."""
+
+    def __init__(
+        self,
+        ckpt_path: Optional[str],
+        indexed_corpus_path: Optional[str],
+        tactic: Optional[str],
+        module: Optional[str],
+        timeout: int,
+        num_sampled_tactics: int,
+        debug: bool,
+    ) -> None:
+        if ckpt_path is None:
+            tac_gen = FixedTacticGenerator(tactic, module)
+        else:
+            tac_gen = RetrievalAugmentedGenerator.load(
+                ckpt_path, device=torch.device("cpu"), freeze=True
+            )
+            if tac_gen.retriever is not None:
+                if indexed_corpus_path is not None:
+                    tac_gen.retriever.load_corpus(indexed_corpus_path)
+                tac_gen.retriever.reindex_corpus(batch_size=32)
+        super().__init__(
+            tac_gen,
+            timeout,
+            num_sampled_tactics,
+            debug,
+        )
+
+@ray.remote(num_gpus=1)
+class GpuProver(MCTSProver):
+    """Ray actor for running an instance of `MCTSProver` on a GPU."""
+
+    def __init__(
+        self,
+        ckpt_path: Optional[str],
+        indexed_corpus_path: Optional[str],
+        tactic: Optional[str],
+        module: Optional[str],
+        timeout: int,
+        num_sampled_tactics: int,
+        debug: bool,
+    ) -> None:
+        if ckpt_path is None:
+            tac_gen = FixedTacticGenerator(tactic, module)
+        else:
+            tac_gen = RetrievalAugmentedGenerator.load(
+                ckpt_path, device=torch.device("cuda"), freeze=True
+            )
+            if tac_gen.retriever is not None:
+                if indexed_corpus_path is not None:
+                    tac_gen.retriever.load_corpus(indexed_corpus_path)
+                tac_gen.retriever.reindex_corpus(batch_size=32)
+        super().__init__(
+            tac_gen,
+            timeout,
+            num_sampled_tactics,
+            debug,
+        )
+
 class BestFirstSearchProver:
     """A prover that uses best-first search to find proofs using a tactic generator."""
 
@@ -556,7 +618,7 @@ class BestFirstSearchProver:
 
 
 @ray.remote
-class CpuProver(MCTSProver):
+class CpuProver(BestFirstSearchProver):
     """Ray actor for running an instance of `BestFirstSearchProver` on a CPU."""
 
     def __init__(
@@ -588,7 +650,7 @@ class CpuProver(MCTSProver):
 
 
 @ray.remote(num_gpus=1)
-class GpuProver(MCTSProver):
+class GpuProver(BestFirstSearchProver):
     """Ray actor for running an instance of `BestFirstSearchProver` on a GPU."""
 
     def __init__(
@@ -617,6 +679,7 @@ class GpuProver(MCTSProver):
             num_sampled_tactics,
             debug,
         )
+
 
 
 class DistributedProver:
@@ -655,7 +718,7 @@ class DistributedProver:
                 if tac_gen.retriever is not None:
                     assert indexed_corpus_path is not None
                     tac_gen.retriever.load_corpus(indexed_corpus_path)
-                mcts= True
+                mcts=False
                 if mcts:
                     self.prover = MCTSProver(
                         tac_gen, timeout, num_sampled_tactics, debug
