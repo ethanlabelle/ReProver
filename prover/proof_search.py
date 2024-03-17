@@ -77,9 +77,7 @@ class MCTSProver:
         self.num_expansions = 0
 
         try:
-            logger.info(f"Trying to build dojo")
             with Dojo(thm, hard_timeout=60 + self.timeout) as (dojo, init_state):
-                logger.info(f"successfully built dojo")
                 self.dojo = dojo
                 self.root = InternalNode(
                     state=init_state,
@@ -104,7 +102,6 @@ class MCTSProver:
                 theorem=thm,
                 status=self.root.status,
                 proof=proof,
-                tree=self.root,
                 actor_time=self.actor_time,
                 environment_time=self.environment_time,
                 total_time=self.total_time,
@@ -144,7 +141,7 @@ class MCTSProver:
                 logger.info("Found a proof!")
                 break
 
-    def _select(self):
+    def _select(self) -> Node:
         node = self.root
         while node.is_explored:
             node = random.choice(node.out_edges).dst
@@ -152,7 +149,7 @@ class MCTSProver:
                 node = self.root
         return node
         
-    def _step(self):
+    def _step(self) -> None:
         """
         Performs a single round of MCTS.
         https://en.wikipedia.org/wiki/Monte_Carlo_tree_search
@@ -168,14 +165,7 @@ class MCTSProver:
         """
         # Search the node with highest priority.
         # search_node = heapq.heappop(self.priority_queue)
-        logger.info(f"Root: {self.root}")
         search_node = self._select()
-        logger.info(f"Expanding node: {search_node}")
-
-        # if self.debug:
-        #     assert all(
-        #         search_node.priority >= node.priority for node in self.priority_queue
-        #     )
 
         if isinstance(search_node.state, TacticState):
             ts = search_node.state.pp
@@ -486,7 +476,7 @@ class BestFirstSearchProver:
         """
         # Search the node with highest priority.
         search_node = heapq.heappop(self.priority_queue)
-        logger.debug(f"Expanding node: {search_node}")
+        logger.info(f"Expanding node: {search_node}")
 
         if self.debug:
             assert all(

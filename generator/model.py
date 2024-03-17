@@ -84,8 +84,8 @@ class RetrievalAugmentedGenerator(TacticGenerator, pl.LightningModule):
         eval_num_retrieved: int,
         eval_num_cpus: int,
         eval_num_theorems: int,
-        max_inp_seq_len: int,
-        max_oup_seq_len: int,
+        max_inp_seq_len: int = 1024,
+        max_oup_seq_len: int = 1024,
         length_penalty: float = 0.0,
         ret_ckpt_path: Optional[str] = None,
     ) -> None:
