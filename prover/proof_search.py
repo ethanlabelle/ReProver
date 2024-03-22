@@ -85,6 +85,7 @@ class MCTSProver:
                 )
                 self.nodes = {init_state: self.root}
                 self.current_root = self.root
+                self.priority_queue = [self.root]
 
                 with torch.no_grad():
                     try:
@@ -141,14 +142,41 @@ class MCTSProver:
                 logger.info("Found a proof!")
                 break
 
-    def _select(self) -> Node:
-        node = self.root
+    # def _select(self) -> Node:
+    #     node = self.root
+    #     while node.is_explored:
+    #         node = random.choice(node.out_edges).dst
+    #         if isinstance(node, ErrorNode):
+    #             node = self.root
+    #     return node
+
+    def _playout_step(self, search_node):
+        node = search_node
         while node.is_explored:
             node = random.choice(node.out_edges).dst
             if isinstance(node, ErrorNode):
-                node = self.root
-        return node
-        
+                node = search_node
+
+        logger.info(f"Expanding node: {node}")
+        logger.info(f"Cumulative logprob: {node.cumulative_logprob}")
+        if isinstance(node.state, TacticState):
+            ts = node.state.pp
+        else:
+            ts = node.state.unsolved_tactic_state
+
+        suggestions = self._generate_tactics(ts)
+        # Try all tactics in order of descending logprob, and collect the results. Any
+        # new nodes are added to `self.nodes`, and edges are added to the result node.
+        results = [
+            self._run_tactic(node, tactic, logprob)
+            for tactic, logprob in suggestions
+        ]
+
+        # Store the fixed out edges of this node, marking it as explored.
+        # This will trigger recursively recomputing tree statistics.
+        node.out_edges = results
+        self.num_expansions += 1
+
     def _step(self) -> None:
         """
         Performs a single round of MCTS.
@@ -163,27 +191,34 @@ class MCTSProver:
 
         4. Update information in nodes along path from root to C.
         """
-        # Search the node with highest priority.
-        # search_node = heapq.heappop(self.priority_queue)
-        search_node = self._select()
+        # Select node with highest priority.
+        search_node = heapq.heappop(self.priority_queue)
+        logger.info(f"Expanding node: {search_node}")
+        logger.info(f"Cumulative logprob: {search_node.cumulative_logprob}")
 
-        if isinstance(search_node.state, TacticState):
-            ts = search_node.state.pp
-        else:
-            ts = search_node.state.unsolved_tactic_state
-        suggestions = self._generate_tactics(ts)
+        # Don't search previously explored nodes or failed nodes
+        if not search_node.is_explored and search_node.status == Status.OPEN:
+            # Expand node
+            if isinstance(search_node.state, TacticState):
+                ts = search_node.state.pp
+            else:
+                ts = search_node.state.unsolved_tactic_state
+            suggestions = self._generate_tactics(ts)
 
-        # Try all tactics in order of descending logprob, and collect the results. Any
-        # new nodes are added to `self.nodes`, and edges are added to the result node.
-        results = [
-            self._run_tactic(search_node, tactic, logprob)
-            for tactic, logprob in suggestions
-        ]
+            # Try all tactics in order of descending logprob, and collect the results. Any
+            # new nodes are added to `self.nodes`, and edges are added to the result node.
+            results = [
+                self._run_tactic(search_node, tactic, logprob)
+                for tactic, logprob in suggestions
+            ]
 
-        # Store the fixed out edges of this node, marking it as explored.
-        # This will trigger recursively recomputing tree statistics.
-        search_node.out_edges = results
-        self.num_expansions += 1
+            # Store the fixed out edges of this node, marking it as explored.
+            # This will trigger recursively recomputing tree statistics.
+            search_node.out_edges = results
+            self.num_expansions += 1
+
+        if self.root.status == Status.OPEN:
+            self._playout_step(search_node)
 
         # If we're running in debug mode, run a full test suite each step
         if self.debug:
@@ -248,8 +283,8 @@ class MCTSProver:
                     cumulative_logprob=logprob + node.cumulative_logprob,
                 )
 
-            # if result_node.status == Status.OPEN:  # Don't search proved/failed nodes
-            #     heapq.heappush(self.priority_queue, result_node)  # type: ignore
+            if result_node.status == Status.OPEN:  # Don't search proved/failed nodes
+                heapq.heappush(self.priority_queue, result_node)  # type: ignore
 
         # Record the new node and add it to the search queue.
         self.nodes[response] = result_node
@@ -701,6 +736,7 @@ class DistributedProver:
             if ckpt_path is None:
                 tac_gen = FixedTacticGenerator(tactic, module)
             else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = "1"
                 device = torch.device("cuda") if with_gpus else torch.device("cpu")
                 tac_gen = RetrievalAugmentedGenerator.load(
                     ckpt_path, device=device, freeze=True
@@ -708,7 +744,7 @@ class DistributedProver:
                 if tac_gen.retriever is not None:
                     assert indexed_corpus_path is not None
                     tac_gen.retriever.load_corpus(indexed_corpus_path)
-                mcts=False
+                mcts=True
                 if mcts:
                     self.prover = MCTSProver(
                         tac_gen, timeout, num_sampled_tactics, debug
