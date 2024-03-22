@@ -73,6 +73,8 @@ class InternalNode(Node):
 
     # The sum of action logprobs along edges from the root to this node
     cumulative_logprob: float = field(compare=False, repr=False)
+    # depth in tree
+    depth: int = field(compare=False, repr=False)
 
     # All edges known to lead to this node.
     # May change at any time as other nodes are explored.
@@ -174,7 +176,7 @@ class InternalNode(Node):
     # NOTE: Nodes are compared by _negative_ priority, to make heapq act as a max-priority-queue.
     @property
     def priority(self) -> float:
-        return self.cumulative_logprob
+        return self.cumulative_logprob/self.depth
 
     def __lt__(self, other: "InternalNode") -> bool:
         return self.priority > other.priority

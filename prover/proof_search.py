@@ -281,6 +281,7 @@ class MCTSProver:
                 result_node = InternalNode(
                     state=response,
                     cumulative_logprob=logprob + node.cumulative_logprob,
+                    depth=node.depth + 1
                 )
 
             if result_node.status == Status.OPEN:  # Don't search proved/failed nodes
@@ -439,6 +440,7 @@ class BestFirstSearchProver:
                 self.root = InternalNode(
                     state=init_state,
                     cumulative_logprob=0.0,
+                    depth=0
                 )
                 self.nodes = {init_state: self.root}
                 self.priority_queue = [self.root]
