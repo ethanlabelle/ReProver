@@ -82,6 +82,7 @@ class MCTSProver:
                 self.root = InternalNode(
                     state=init_state,
                     cumulative_logprob=0.0,
+                    depth=0
                 )
                 self.nodes = {init_state: self.root}
                 self.current_root = self.root
@@ -514,6 +515,8 @@ class BestFirstSearchProver:
         # Search the node with highest priority.
         search_node = heapq.heappop(self.priority_queue)
         logger.info(f"Expanding node: {search_node}")
+        logger.info(f"Cumulative logprob: {search_node.cumulative_logprob}")
+        logger.info(f"depth: {search_node.depth}")
 
         if self.debug:
             assert all(
@@ -593,6 +596,7 @@ class BestFirstSearchProver:
                 result_node = InternalNode(
                     state=response,
                     cumulative_logprob=logprob + node.cumulative_logprob,
+                    depth=node.depth + 1
                 )
 
             if result_node.status == Status.OPEN:  # Don't search proved/failed nodes
@@ -746,7 +750,7 @@ class DistributedProver:
                 if tac_gen.retriever is not None:
                     assert indexed_corpus_path is not None
                     tac_gen.retriever.load_corpus(indexed_corpus_path)
-                mcts=True
+                mcts=False
                 if mcts:
                     self.prover = MCTSProver(
                         tac_gen, timeout, num_sampled_tactics, debug

@@ -176,7 +176,13 @@ class InternalNode(Node):
     # NOTE: Nodes are compared by _negative_ priority, to make heapq act as a max-priority-queue.
     @property
     def priority(self) -> float:
-        return self.cumulative_logprob/self.depth
+        if not self.depth:
+            return 0
+        if isinstance(self.state, TacticState):
+            ts = self.state.pp
+        else:
+            ts = self.state.unsolved_tactic_state
+        return self.cumulative_logprob/self.depth * len(ts.strip())
 
     def __lt__(self, other: "InternalNode") -> bool:
         return self.priority > other.priority
