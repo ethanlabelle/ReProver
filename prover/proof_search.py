@@ -514,9 +514,10 @@ class BestFirstSearchProver:
         """
         # Search the node with highest priority.
         search_node = heapq.heappop(self.priority_queue)
-        logger.info(f"Expanding node: {search_node}")
-        logger.info(f"Cumulative logprob: {search_node.cumulative_logprob}")
-        logger.info(f"depth: {search_node.depth}")
+        # logger.info(f"Expanding node: {search_node}")
+        # logger.info(f"Cumulative logprob: {search_node.cumulative_logprob}")
+        # logger.info(f"depth: {search_node.depth}")
+        # logger.info(f"partial proof: {search_node.partial_proof(self.root)}")
 
         if self.debug:
             assert all(

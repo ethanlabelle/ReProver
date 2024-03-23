@@ -41,7 +41,7 @@ class Node(ABC):
         raise NotImplementedError
 
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class ProofFinishedNode(Node):
     inner: ProofFinished
     status = Status.PROVED
@@ -49,7 +49,7 @@ class ProofFinishedNode(Node):
     is_terminal = True
 
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class ErrorNode(Node):
     inner: Union[LeanError, TimeoutError, ProofGivenUp]
     status = Status.FAILED
@@ -173,16 +173,51 @@ class InternalNode(Node):
             for edge in self.in_edges:
                 edge.src._recompute_distance_to_proof()
 
+    def dfs_helper(self, node, visited, parents):
+        if isinstance(node, ErrorNode):
+            return
+        if node.out_edges:
+            for edge in node.out_edges:
+                dst_node = edge.dst
+                if dst_node not in visited:
+                    parents[dst_node] = edge 
+                    visited.add(dst_node)
+                    self.dfs_helper(dst_node, visited, parents)
+    
+    # returns shortest path to self from root
+    def dfs(self, root):
+        visited = set()
+        parents = {}
+        visited.add(root)
+        if root.out_edges:
+            for edge in root.out_edges:
+                node = edge.dst
+                if node not in visited:
+                    parents[node] = edge 
+                    visited.add(node)
+                    self.dfs_helper(node, visited, parents)
+        assert self in visited
+        return parents
+
+
+    def partial_proof(self, root):
+        
+        parents = self.dfs(root)
+        node = self
+        proof = '\n'
+        while node in parents:
+            proof = '\n' +  parents[node].tactic + proof
+            node = parents[node].src
+        return proof
+
     # NOTE: Nodes are compared by _negative_ priority, to make heapq act as a max-priority-queue.
     @property
     def priority(self) -> float:
-        if not self.depth:
-            return 0
         if isinstance(self.state, TacticState):
             ts = self.state.pp
         else:
             ts = self.state.unsolved_tactic_state
-        return self.cumulative_logprob/self.depth * len(ts.strip())
+        return self.cumulative_logprob * len(ts.strip())
 
     def __lt__(self, other: "InternalNode") -> bool:
         return self.priority > other.priority
