@@ -63,6 +63,13 @@ class MCTSProver:
         self.actor_time = 0.0
         self.environment_time = 0.0
         self.total_time = None
+        self.value_counts = {} # (in_edge.src, in_edge.tactic) -> float
+        self.visit_counts = {} # (in_edge.src, in_edge.tactic) -> int
+    def init_counts(self, node):
+        assert isinstance(node, InternalNode)
+        if node.parent_edge:
+            self.value_counts[(node.parent_edge.src, node.parent_edge.tactic)] = 0
+            self.visit_counts[(node.parent_edge.src, node.parent_edge.tactic)] = 0
 
     def search(
         self, repo: LeanGitRepo, thm: Theorem, pos: Pos
@@ -143,40 +150,81 @@ class MCTSProver:
                 logger.info("Found a proof!")
                 break
 
-    # def _select(self) -> Node:
-    #     node = self.root
-    #     while node.is_explored:
-    #         node = random.choice(node.out_edges).dst
-    #         if isinstance(node, ErrorNode):
-    #             node = self.root
-    #     return node
-
-    def _playout_step(self, search_node):
-        node = search_node
+    def _random_walk_select(self) -> Node:
+        node = self.root
         while node.is_explored:
             node = random.choice(node.out_edges).dst
             if isinstance(node, ErrorNode):
-                node = search_node
+                node = self.root
+        return node
 
-        logger.info(f"Expanding node: {node}")
-        logger.info(f"Cumulative logprob: {node.cumulative_logprob}")
-        if isinstance(node.state, TacticState):
-            ts = node.state.pp
-        else:
-            ts = node.state.unsolved_tactic_state
+    def back_propagate(self, search_node):
+        node = search_node
+        while node.parent:
+            # print(node)
+            edge = node.parent_edge
+            self.visit_counts[(edge.src, edge.tactic)] += 1
+            # print(self.visit_counts[(edge.src, edge.tactic)])
+            self.value_counts[(edge.src, edge.tactic)] += search_node.logprob
+            # print(self.value_counts[(edge.src, edge.tactic)])
+            # if node.parent:
+            #     print(self.puct_score(node))
+            node = edge.src
 
-        suggestions = self._generate_tactics(ts)
-        # Try all tactics in order of descending logprob, and collect the results. Any
-        # new nodes are added to `self.nodes`, and edges are added to the result node.
-        results = [
-            self._run_tactic(node, tactic, logprob)
-            for tactic, logprob in suggestions
-        ]
 
-        # Store the fixed out edges of this node, marking it as explored.
-        # This will trigger recursively recomputing tree statistics.
-        node.out_edges = results
-        self.num_expansions += 1
+    def _parent_sum(self, parent_node):
+        total = 0
+        if not parent_node.out_edges:
+            return total
+        for edge in parent_node.out_edges:
+            if (edge.src, edge.tactic) in self.visit_counts:
+                total += self.visit_counts[(edge.src, edge.tactic)]
+        return total
+
+    def puct_score(self, search_node):
+        # print(search_node)
+        assert search_node.parent_edge
+        edge = search_node.parent_edge
+        c = 0.5
+        return self.value_counts[(edge.src, edge.tactic)] / self.visit_counts[(edge.src, edge.tactic)] + c * search_node.logprob * ((self._parent_sum(edge.src)**0.5)/self.visit_counts[(edge.src, edge.tactic)])
+
+
+    def _mcts_select(self) -> Node:
+        node = self.root
+        while node.is_explored:
+            node = max([edge.dst for edge in node.out_edges if isinstance(edge.dst, InternalNode) and not edge.dst == self.root and not edge.dst == node], key=self.puct_score)
+            print(node)
+            # node = random.choice(node.out_edges).dst
+            assert node
+            # if isinstance(node, ErrorNode):
+            #     node = self.root
+        return node
+    # def _playout_step(self, search_node):
+    #     node = search_node
+    #     while node.is_explored:
+    #         node = random.choice(node.out_edges).dst
+    #         if isinstance(node, ErrorNode):
+    #             node = search_node
+
+    #     logger.info(f"Expanding node: {node}")
+    #     logger.info(f"Cumulative logprob: {node.cumulative_logprob}")
+    #     if isinstance(node.state, TacticState):
+    #         ts = node.state.pp
+    #     else:
+    #         ts = node.state.unsolved_tactic_state
+
+    #     suggestions = self._generate_tactics(ts)
+    #     # Try all tactics in order of descending logprob, and collect the results. Any
+    #     # new nodes are added to `self.nodes`, and edges are added to the result node.
+    #     results = [
+    #         self._run_tactic(node, tactic, logprob)
+    #         for tactic, logprob in suggestions
+    #     ]
+
+    #     # Store the fixed out edges of this node, marking it as explored.
+    #     # This will trigger recursively recomputing tree statistics.
+    #     node.out_edges = results
+    #     self.num_expansions += 1
 
     def _step(self) -> None:
         """
@@ -192,34 +240,38 @@ class MCTSProver:
 
         4. Update information in nodes along path from root to C.
         """
+        # puct candidate:
+        search_node = self._mcts_select()
+        logger.info(f"selection candidate node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
         # Select node with highest priority.
-        search_node = heapq.heappop(self.priority_queue)
-        logger.info(f"Expanding node: {search_node}")
-        logger.info(f"Cumulative logprob: {search_node.cumulative_logprob}")
+        if not search_node:
+            search_node = heapq.heappop(self.priority_queue)
+            logger.info(f"MCTS selection failed... Expanding node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
+        
 
         # Don't search previously explored nodes or failed nodes
-        if not search_node.is_explored and search_node.status == Status.OPEN:
-            # Expand node
-            if isinstance(search_node.state, TacticState):
-                ts = search_node.state.pp
-            else:
-                ts = search_node.state.unsolved_tactic_state
-            suggestions = self._generate_tactics(ts)
+        assert not search_node.is_explored and search_node.status == Status.OPEN
 
-            # Try all tactics in order of descending logprob, and collect the results. Any
-            # new nodes are added to `self.nodes`, and edges are added to the result node.
-            results = [
-                self._run_tactic(search_node, tactic, logprob)
-                for tactic, logprob in suggestions
-            ]
+        # Expand node
+        if isinstance(search_node.state, TacticState):
+            ts = search_node.state.pp
+        else:
+            ts = search_node.state.unsolved_tactic_state
+        suggestions = self._generate_tactics(ts)
 
-            # Store the fixed out edges of this node, marking it as explored.
-            # This will trigger recursively recomputing tree statistics.
-            search_node.out_edges = results
-            self.num_expansions += 1
+        # Try all tactics in order of descending logprob, and collect the results. Any
+        # new nodes are added to `self.nodes`, and edges are added to the result node.
+        # self._run_tactic implements backpropagation.
+        results = [
+            self._run_tactic(search_node, tactic, logprob)
+            for tactic, logprob in suggestions
+        ]
+        results = filter(lambda edge: edge.src == search_node, results)
 
-        if self.root.status == Status.OPEN:
-            self._playout_step(search_node)
+        # Store the fixed out edges of this node, marking it as explored.
+        # This will trigger recursively recomputing tree statistics.
+        search_node.out_edges = results
+        self.num_expansions += 1
 
         # If we're running in debug mode, run a full test suite each step
         if self.debug:
@@ -264,10 +316,13 @@ class MCTSProver:
         elapsed = time.monotonic() - t0
         self.environment_time += elapsed
 
+        is_new_node = False
+
         try:
             # If we've seen this response before, use the existing node
             result_node = self.nodes[response]
         except KeyError:
+            is_new_node = True
             # Build a new node
             if isinstance(response, ProofFinished):
                 result_node = ProofFinishedNode(response)
@@ -282,7 +337,9 @@ class MCTSProver:
                 result_node = InternalNode(
                     state=response,
                     cumulative_logprob=logprob + node.cumulative_logprob,
-                    depth=node.depth + 1
+                    depth=node.depth + 1,
+                    parent=node,
+                    logprob=logprob
                 )
 
             if result_node.status == Status.OPEN:  # Don't search proved/failed nodes
@@ -296,7 +353,11 @@ class MCTSProver:
         edge = Edge(tactic=tactic, src=node, dst=result_node)
 
         if isinstance(result_node, InternalNode):
-            result_node.in_edges.append(edge)
+            if is_new_node:
+                result_node.parent_edge = edge
+                self.init_counts(result_node)
+                result_node.in_edges.append(edge)
+            self.back_propagate(result_node)
 
         return edge
 
@@ -597,7 +658,9 @@ class BestFirstSearchProver:
                 result_node = InternalNode(
                     state=response,
                     cumulative_logprob=logprob + node.cumulative_logprob,
-                    depth=node.depth + 1
+                    depth=node.depth + 1,
+                    parent=node,
+                    logprob=logprob
                 )
 
             if result_node.status == Status.OPEN:  # Don't search proved/failed nodes
@@ -649,68 +712,68 @@ class BestFirstSearchProver:
                 node.check_invariants()
 
 
-@ray.remote
-class CpuProver(BestFirstSearchProver):
-    """Ray actor for running an instance of `BestFirstSearchProver` on a CPU."""
-
-    def __init__(
-        self,
-        ckpt_path: Optional[str],
-        indexed_corpus_path: Optional[str],
-        tactic: Optional[str],
-        module: Optional[str],
-        timeout: int,
-        num_sampled_tactics: int,
-        debug: bool,
-    ) -> None:
-        if ckpt_path is None:
-            tac_gen = FixedTacticGenerator(tactic, module)
-        else:
-            tac_gen = RetrievalAugmentedGenerator.load(
-                ckpt_path, device=torch.device("cpu"), freeze=True
-            )
-            if tac_gen.retriever is not None:
-                if indexed_corpus_path is not None:
-                    tac_gen.retriever.load_corpus(indexed_corpus_path)
-                tac_gen.retriever.reindex_corpus(batch_size=32)
-        super().__init__(
-            tac_gen,
-            timeout,
-            num_sampled_tactics,
-            debug,
-        )
-
-
-@ray.remote(num_gpus=1)
-class GpuProver(BestFirstSearchProver):
-    """Ray actor for running an instance of `BestFirstSearchProver` on a GPU."""
-
-    def __init__(
-        self,
-        ckpt_path: Optional[str],
-        indexed_corpus_path: Optional[str],
-        tactic: Optional[str],
-        module: Optional[str],
-        timeout: int,
-        num_sampled_tactics: int,
-        debug: bool,
-    ) -> None:
-        if ckpt_path is None:
-            tac_gen = FixedTacticGenerator(tactic, module)
-        else:
-            tac_gen = RetrievalAugmentedGenerator.load(
-                ckpt_path, device=torch.device("cuda"), freeze=True
-            )
-            if tac_gen.retriever is not None:
-                if indexed_corpus_path is not None:
-                    tac_gen.retriever.load_corpus(indexed_corpus_path)
-                tac_gen.retriever.reindex_corpus(batch_size=32)
-        super().__init__(
-            tac_gen,
-            timeout,
-            num_sampled_tactics,
-            debug,
-        )
+# @ray.remote
+# class CpuProver(BestFirstSearchProver):
+#     """Ray actor for running an instance of `BestFirstSearchProver` on a CPU."""
+# 
+#     def __init__(
+#         self,
+#         ckpt_path: Optional[str],
+#         indexed_corpus_path: Optional[str],
+#         tactic: Optional[str],
+#         module: Optional[str],
+#         timeout: int,
+#         num_sampled_tactics: int,
+#         debug: bool,
+#     ) -> None:
+#         if ckpt_path is None:
+#             tac_gen = FixedTacticGenerator(tactic, module)
+#         else:
+#             tac_gen = RetrievalAugmentedGenerator.load(
+#                 ckpt_path, device=torch.device("cpu"), freeze=True
+#             )
+#             if tac_gen.retriever is not None:
+#                 if indexed_corpus_path is not None:
+#                     tac_gen.retriever.load_corpus(indexed_corpus_path)
+#                 tac_gen.retriever.reindex_corpus(batch_size=32)
+#         super().__init__(
+#             tac_gen,
+#             timeout,
+#             num_sampled_tactics,
+#             debug,
+#         )
+# 
+# 
+# @ray.remote(num_gpus=1)
+# class GpuProver(BestFirstSearchProver):
+#     """Ray actor for running an instance of `BestFirstSearchProver` on a GPU."""
+# 
+#     def __init__(
+#         self,
+#         ckpt_path: Optional[str],
+#         indexed_corpus_path: Optional[str],
+#         tactic: Optional[str],
+#         module: Optional[str],
+#         timeout: int,
+#         num_sampled_tactics: int,
+#         debug: bool,
+#     ) -> None:
+#         if ckpt_path is None:
+#             tac_gen = FixedTacticGenerator(tactic, module)
+#         else:
+#             tac_gen = RetrievalAugmentedGenerator.load(
+#                 ckpt_path, device=torch.device("cuda"), freeze=True
+#             )
+#             if tac_gen.retriever is not None:
+#                 if indexed_corpus_path is not None:
+#                     tac_gen.retriever.load_corpus(indexed_corpus_path)
+#                 tac_gen.retriever.reindex_corpus(batch_size=32)
+#         super().__init__(
+#             tac_gen,
+#             timeout,
+#             num_sampled_tactics,
+#             debug,
+#         )
 
 
 
@@ -751,7 +814,7 @@ class DistributedProver:
                 if tac_gen.retriever is not None:
                     assert indexed_corpus_path is not None
                     tac_gen.retriever.load_corpus(indexed_corpus_path)
-                mcts=False
+                mcts=True
                 if mcts:
                     self.prover = MCTSProver(
                         tac_gen, timeout, num_sampled_tactics, debug

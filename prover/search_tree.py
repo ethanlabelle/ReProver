@@ -72,9 +72,9 @@ class InternalNode(Node):
     state: TacticState = field(compare=True)
 
     # The sum of action logprobs along edges from the root to this node
-    cumulative_logprob: float = field(compare=False, repr=False)
+    cumulative_logprob: float = field(compare=False, repr=True)
     # depth in tree
-    depth: int = field(compare=False, repr=False)
+    depth: int = field(compare=False, repr=True)
 
     # All edges known to lead to this node.
     # May change at any time as other nodes are explored.
@@ -100,6 +100,17 @@ class InternalNode(Node):
     # optimal path. If unproved, infinity. Updated as needed by children.
     _distance_to_proof: float = field(
         default=math.inf, init=False, compare=False, repr=False
+    )
+
+    # MCTS state
+    logprob: float = field(
+        default=0, compare=False, repr=True
+    )
+    parent: Optional["InternalNode"] = field(
+            default=None, compare=False, repr=False
+    )
+    parent_edge: Optional["Edge"] = field(
+            default=None, compare=False, repr=False
     )
 
     @property
@@ -218,6 +229,8 @@ class InternalNode(Node):
         else:
             ts = self.state.unsolved_tactic_state
         return self.cumulative_logprob * len(ts.strip())
+        # return self.cumulative_logprob
+
 
     def __lt__(self, other: "InternalNode") -> bool:
         return self.priority > other.priority
