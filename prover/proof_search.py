@@ -186,14 +186,18 @@ class MCTSProver:
         assert search_node.parent_edge
         edge = search_node.parent_edge
         c = 0.5
-        return self.value_counts[(edge.src, edge.tactic)] / self.visit_counts[(edge.src, edge.tactic)] + c * search_node.logprob * ((self._parent_sum(edge.src)**0.5)/self.visit_counts[(edge.src, edge.tactic)])
+#        retur nself.value_counts[(edge.src, edge.tactic)] / self.visit_counts[(edge.src, edge.tactic)] + c * search_node.logprob * ((self._parent_sum(edge.src)**0.5)/self.visit_counts[(edge.src, edge.tactic)])
+        exploit = self.value_counts[(edge.src, edge.tactic)] / self.visit_counts[(edge.src, edge.tactic)]
+        explore = c * search_node.logprob * (self.visit_counts[(edge.src, edge.tactic)] / (self._parent_sum(edge.src)**0.5))
+        # print(explore, exploit)
+        return explore + exploit
 
 
     def _mcts_select(self) -> Node:
         node = self.root
         while node.is_explored:
             node = max([edge.dst for edge in node.out_edges if isinstance(edge.dst, InternalNode) and not edge.dst == self.root and not edge.dst == node], key=self.puct_score)
-            print(node)
+            # print(node)
             # node = random.choice(node.out_edges).dst
             assert node
             # if isinstance(node, ErrorNode):
@@ -241,12 +245,15 @@ class MCTSProver:
         4. Update information in nodes along path from root to C.
         """
         # puct candidate:
-        search_node = self._mcts_select()
-        logger.info(f"selection candidate node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
+        try:
+            search_node = self._mcts_select()
+            # logger.info(f"selection candidate node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
         # Select node with highest priority.
-        if not search_node:
+        except:
             search_node = heapq.heappop(self.priority_queue)
-            logger.info(f"MCTS selection failed... Expanding node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
+            # logger.info(f"MCTS selection failed... Expanding node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
+            if search_node.status != Status.OPEN or search_node.is_explored:
+                return
         
 
         # Don't search previously explored nodes or failed nodes
@@ -266,7 +273,7 @@ class MCTSProver:
             self._run_tactic(search_node, tactic, logprob)
             for tactic, logprob in suggestions
         ]
-        results = filter(lambda edge: edge.src == search_node, results)
+        results = filter(lambda edge: not isinstance(edge.dst, InternalNode) or edge.dst.parent == search_node, results)
 
         # Store the fixed out edges of this node, marking it as explored.
         # This will trigger recursively recomputing tree statistics.
