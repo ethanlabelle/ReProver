@@ -302,7 +302,7 @@ class InternalNode(Node):
             assert self.extract_proof() == None
 
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class Edge:
     """An edge in the search tree, representing a tactic."""
 

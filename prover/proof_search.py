@@ -128,7 +128,7 @@ class MCTSProver:
         time_start = time.monotonic()
 
         while True:
-            logger.info("trying")
+            # logger.info("trying")
             try:
                 self._step()
             except DojoHardTimeoutError:
@@ -196,39 +196,43 @@ class MCTSProver:
     def _mcts_select(self) -> Node:
         node = self.root
         while node.is_explored:
-            node = max([edge.dst for edge in node.out_edges if isinstance(edge.dst, InternalNode) and not edge.dst == self.root and not edge.dst == node], key=self.puct_score)
+            node._recompute_status()
+            edges = node.out_edges
+            edges = list(filter(lambda edge: isinstance(edge.dst, InternalNode) and not edge.dst == self.root and not edge.dst == node, edges))
+            node = max([edge.dst for edge in edges], key=self.puct_score)
+            assert node
             # print(node)
             # node = random.choice(node.out_edges).dst
-            assert node
             # if isinstance(node, ErrorNode):
             #     node = self.root
         return node
-    # def _playout_step(self, search_node):
-    #     node = search_node
-    #     while node.is_explored:
-    #         node = random.choice(node.out_edges).dst
-    #         if isinstance(node, ErrorNode):
-    #             node = search_node
 
-    #     logger.info(f"Expanding node: {node}")
-    #     logger.info(f"Cumulative logprob: {node.cumulative_logprob}")
-    #     if isinstance(node.state, TacticState):
-    #         ts = node.state.pp
-    #     else:
-    #         ts = node.state.unsolved_tactic_state
 
-    #     suggestions = self._generate_tactics(ts)
-    #     # Try all tactics in order of descending logprob, and collect the results. Any
-    #     # new nodes are added to `self.nodes`, and edges are added to the result node.
-    #     results = [
-    #         self._run_tactic(node, tactic, logprob)
-    #         for tactic, logprob in suggestions
-    #     ]
+    def _expand_node(self, search_node):
+        # Expand node
+        if isinstance(search_node.state, TacticState):
+            ts = search_node.state.pp
+        else:
+            ts = search_node.state.unsolved_tactic_state
+        suggestions = self._generate_tactics(ts)
 
-    #     # Store the fixed out edges of this node, marking it as explored.
-    #     # This will trigger recursively recomputing tree statistics.
-    #     node.out_edges = results
-    #     self.num_expansions += 1
+        # Try all tactics in order of descending logprob, and collect the results. Any
+        # new nodes are added to `self.nodes`, and edges are added to the result node.
+        # self._run_tactic implements backpropagation.
+        results = [
+            self._run_tactic(search_node, tactic, logprob)
+            for tactic, logprob in suggestions
+        ]
+        # not isinstance is a hack for python classing... non internal nodes do not have parents
+        # simple fix for later TODO
+        results = filter(lambda edge: (not isinstance(edge.dst, InternalNode) or (edge.dst.parent == search_node)), results)
+
+        # Store the fixed out edges of this node, marking it as explored.
+        # This will trigger recursively recomputing tree statistics.
+        search_node.out_edges = list(results)
+        self.num_expansions += 1
+
+        return
 
     def _step(self) -> None:
         """
@@ -244,13 +248,13 @@ class MCTSProver:
 
         4. Update information in nodes along path from root to C.
         """
-        # puct candidate:
         try:
             search_node = self._mcts_select()
             # logger.info(f"selection candidate node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
         # Select node with highest priority.
         except:
-            search_node = heapq.heappop(self.priority_queue)
+            # search_node = heapq.heappop(self.priority_queue)
+            search_node = self._random_walk_select()
             # logger.info(f"MCTS selection failed... Expanding node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
             if search_node.status != Status.OPEN or search_node.is_explored:
                 return
@@ -259,26 +263,28 @@ class MCTSProver:
         # Don't search previously explored nodes or failed nodes
         assert not search_node.is_explored and search_node.status == Status.OPEN
 
-        # Expand node
-        if isinstance(search_node.state, TacticState):
-            ts = search_node.state.pp
-        else:
-            ts = search_node.state.unsolved_tactic_state
-        suggestions = self._generate_tactics(ts)
 
-        # Try all tactics in order of descending logprob, and collect the results. Any
-        # new nodes are added to `self.nodes`, and edges are added to the result node.
-        # self._run_tactic implements backpropagation.
-        results = [
-            self._run_tactic(search_node, tactic, logprob)
-            for tactic, logprob in suggestions
-        ]
-        results = filter(lambda edge: not isinstance(edge.dst, InternalNode) or edge.dst.parent == search_node, results)
+        self._expand_node(search_node)
+        # # Expand node
+        # if isinstance(search_node.state, TacticState):
+        #     ts = search_node.state.pp
+        # else:
+        #     ts = search_node.state.unsolved_tactic_state
+        # suggestions = self._generate_tactics(ts)
 
-        # Store the fixed out edges of this node, marking it as explored.
-        # This will trigger recursively recomputing tree statistics.
-        search_node.out_edges = results
-        self.num_expansions += 1
+        # # Try all tactics in order of descending logprob, and collect the results. Any
+        # # new nodes are added to `self.nodes`, and edges are added to the result node.
+        # # self._run_tactic implements backpropagation.
+        # results = [
+        #     self._run_tactic(search_node, tactic, logprob)
+        #     for tactic, logprob in suggestions
+        # ]
+        # results = filter(lambda edge: (not isinstance(edge.dst, InternalNode) or edge.dst.parent == search_node), results)
+
+        # # Store the fixed out edges of this node, marking it as explored.
+        # # This will trigger recursively recomputing tree statistics.
+        # search_node.out_edges = results
+        # self.num_expansions += 1
 
         # If we're running in debug mode, run a full test suite each step
         if self.debug:
@@ -311,7 +317,26 @@ class MCTSProver:
             num_samples=self.num_sampled_tactics,
         )
 
+        has_intro = False
+        has_by_contra = False
         self.actor_time += time.monotonic() - t0
+        new_suggestions = []
+        for tactic in suggestions:
+            try:
+                tac = tactic[0].split()[0]
+                if tac == "intro":
+                    has_intro = True 
+                elif tac == "by_contra" or tac == "by_contradiction":
+                    has_by_contra = True
+                else:
+                    new_suggestions.append(tactic)
+            except:
+                new_suggestions.append(tactic)
+        if has_intro:
+            new_suggestions.append(('intro', -1))
+        if has_by_contra:
+            new_suggestions.append(('by_contra', -1))
+        suggestions = new_suggestions
 
         logger.debug(f"Tactic suggestions: {suggestions}")
         return suggestions
