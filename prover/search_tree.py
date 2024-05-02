@@ -106,6 +106,9 @@ class InternalNode(Node):
     logprob: float = field(
         default=0, compare=False, repr=True
     )
+    ts_len: int = field(
+        default=0, compare=False, repr=True
+    )
     parent: Optional["InternalNode"] = field(
             default=None, compare=False, repr=False
     )
@@ -211,14 +214,22 @@ class InternalNode(Node):
         return parents
 
 
-    def partial_proof(self, root):
-        
-        parents = self.dfs(root)
+    # def partial_proof(self, root):
+    #     
+    #     parents = self.dfs(root)
+    #     node = self
+    #     proof = '\n'
+    #     while node in parents:
+    #         proof = '\n' +  parents[node].tactic + proof
+    #         node = parents[node].src
+    #     return proof
+
+    def partial_proof(self):
+        proof = []
         node = self
-        proof = '\n'
-        while node in parents:
-            proof = '\n' +  parents[node].tactic + proof
-            node = parents[node].src
+        while node.parent:
+            proof = [node.parent_edge.tactic] + proof
+            node = node.parent_edge.src
         return proof
 
     # NOTE: Nodes are compared by _negative_ priority, to make heapq act as a max-priority-queue.

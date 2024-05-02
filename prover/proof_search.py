@@ -30,6 +30,43 @@ from common import zip_strict
 from prover.search_tree import *
 from generator.model import RetrievalAugmentedGenerator, FixedTacticGenerator
 
+import multiprocessing as mp
+from multiprocessing import Pool
+
+# def dojo_factory(args):
+#     theorem, timeout = args
+#     print(args)
+#     # return Dojo(theorem, hard_timeout=60 + timeout)
+
+def run_parallel_dojo(args):
+    theorem, timeout, task_queue, result_queue = args
+    print(args)
+    with Dojo(theorem, hard_timeout=60 + timeout) as (dojo, _):
+        visited = set()
+        while True:
+            next_task = task_queue.get()
+            print(task_queue)
+            print(len(task_queue))
+            if not next_task:
+                return
+            node, tactic, logprob = next_task
+            print(node.partial_proof())
+
+            # t0 = time.monotonic()
+            # response = dojo.run_tac(node.state, tactic) 
+            # print(response)
+            # elapsed = time.monotonic() - t0
+            # result_queue.put((node, tactic, logprob, response, elapsed))
+
+
+# def _parallel_run_tactic(args):
+#     dojo, node, tactic, logprob = args
+#     t0 = time.monotonic()
+#     with dojo as dojo:
+#         response = dojo.run_tac(node.state, tactic) 
+#     elapsed = time.monotonic() - t0
+#     return (node, tactic, logprob, response, elapsed)
+
 
 @dataclass(frozen=True)
 class SearchResult:
@@ -71,6 +108,9 @@ class MCTSProver:
             self.value_counts[(node.parent_edge.src, node.parent_edge.tactic)] = 0
             self.visit_counts[(node.parent_edge.src, node.parent_edge.tactic)] = 0
 
+#     def dojo_factory(self, i):
+#         return Dojo(self.theorem, hard_timeout=60 + self.timeout)
+
     def search(
         self, repo: LeanGitRepo, thm: Theorem, pos: Pos
     ) -> Optional[SearchResult]:
@@ -82,9 +122,21 @@ class MCTSProver:
         self.actor_time = 0.0
         self.environment_time = 0.0
         self.num_expansions = 0
+        self.tasks = mp.JoinableQueue()
+        self.results = mp.Queue()
 
         try:
             with Dojo(thm, hard_timeout=60 + self.timeout) as (dojo, init_state):
+                ## HELPER DOJOS
+                self.num_dojos = 2
+                timeout = 60 + self.timeout
+                tasks = self.tasks
+                results = self.results
+                # for i in range(self.num_dojos):
+                #     p = mp.Process(target=run_parallel_dojo, args=((thm, timeout, tasks, results),))
+                #     p.start()
+
+                ## SOLO DOJO
                 self.dojo = dojo
                 self.root = InternalNode(
                     state=init_state,
@@ -118,6 +170,9 @@ class MCTSProver:
                 num_searched_nodes=self.num_expansions,
             )
             logger.info(result)
+            # for i in range(self.num_dojos):
+            #     self.tasks.put(None)
+            # self.tasks.join()
             return result
 
         except DojoInitError as ex:
@@ -166,6 +221,7 @@ class MCTSProver:
             self.visit_counts[(edge.src, edge.tactic)] += 1
             # print(self.visit_counts[(edge.src, edge.tactic)])
             self.value_counts[(edge.src, edge.tactic)] += search_node.logprob
+            # self.value_counts[(edge.src, edge.tactic)] += 10**search_node.logprob
             # print(self.value_counts[(edge.src, edge.tactic)])
             # if node.parent:
             #     print(self.puct_score(node))
@@ -185,10 +241,12 @@ class MCTSProver:
         # print(search_node)
         assert search_node.parent_edge
         edge = search_node.parent_edge
-        c = 0.5
+        c = 0.5 
 #        retur nself.value_counts[(edge.src, edge.tactic)] / self.visit_counts[(edge.src, edge.tactic)] + c * search_node.logprob * ((self._parent_sum(edge.src)**0.5)/self.visit_counts[(edge.src, edge.tactic)])
         exploit = self.value_counts[(edge.src, edge.tactic)] / self.visit_counts[(edge.src, edge.tactic)]
+        # explore = c * search_node.logprob * search_node.ts_len * (self.visit_counts[(edge.src, edge.tactic)] / (self._parent_sum(edge.src)**0.5))
         explore = c * search_node.logprob * (self.visit_counts[(edge.src, edge.tactic)] / (self._parent_sum(edge.src)**0.5))
+        # explore = c * 10**search_node.logprob * ((self._parent_sum(edge.src)**0.5) / self.visit_counts[(edge.src, edge.tactic)])
         # print(explore, exploit)
         return explore + exploit
 
@@ -198,41 +256,21 @@ class MCTSProver:
         while node.is_explored:
             node._recompute_status()
             edges = node.out_edges
-            edges = list(filter(lambda edge: isinstance(edge.dst, InternalNode) and not edge.dst == self.root and not edge.dst == node, edges))
-            node = max([edge.dst for edge in edges], key=self.puct_score)
-            assert node
+            edges = list(filter(lambda edge: isinstance(edge.dst, InternalNode) and not edge.dst == self.root and not edge.dst == node and not edge.dst.status == Status.FAILED, edges))
+            if not edges:
+                print(node)
+                print(node.out_edges)
+            new_node = max([edge.dst for edge in edges], key=self.puct_score)
+            if not new_node:
+                print(node.out_edges)
+            assert new_node
+            node = new_node
             # print(node)
             # node = random.choice(node.out_edges).dst
             # if isinstance(node, ErrorNode):
             #     node = self.root
         return node
 
-
-    def _expand_node(self, search_node):
-        # Expand node
-        if isinstance(search_node.state, TacticState):
-            ts = search_node.state.pp
-        else:
-            ts = search_node.state.unsolved_tactic_state
-        suggestions = self._generate_tactics(ts)
-
-        # Try all tactics in order of descending logprob, and collect the results. Any
-        # new nodes are added to `self.nodes`, and edges are added to the result node.
-        # self._run_tactic implements backpropagation.
-        results = [
-            self._run_tactic(search_node, tactic, logprob)
-            for tactic, logprob in suggestions
-        ]
-        # not isinstance is a hack for python classing... non internal nodes do not have parents
-        # simple fix for later TODO
-        results = filter(lambda edge: (not isinstance(edge.dst, InternalNode) or (edge.dst.parent == search_node)), results)
-
-        # Store the fixed out edges of this node, marking it as explored.
-        # This will trigger recursively recomputing tree statistics.
-        search_node.out_edges = list(results)
-        self.num_expansions += 1
-
-        return
 
     def _step(self) -> None:
         """
@@ -248,16 +286,18 @@ class MCTSProver:
 
         4. Update information in nodes along path from root to C.
         """
-        try:
-            search_node = self._mcts_select()
-            # logger.info(f"selection candidate node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
-        # Select node with highest priority.
-        except:
-            # search_node = heapq.heappop(self.priority_queue)
-            search_node = self._random_walk_select()
-            # logger.info(f"MCTS selection failed... Expanding node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
-            if search_node.status != Status.OPEN or search_node.is_explored:
-                return
+        search_node = self._mcts_select()
+        logger.info(f"selection candidate node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof()}")
+        # try:
+        #     search_node = self._mcts_select()
+        #     # logger.info(f"selection candidate node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
+        # # Select node with highest priority.
+        # except:
+        #     # search_node = heapq.heappop(self.priority_queue)
+        #     search_node = self._random_walk_select()
+        #     # logger.info(f"MCTS selection failed... Expanding node: {search_node}\nCumulative logprob: {search_node.cumulative_logprob}\nQueue Size: {len(self.priority_queue)}\n Partial proof: {search_node.partial_proof(self.root)}")
+        #     if search_node.status != Status.OPEN or search_node.is_explored:
+        #         return
         
 
         # Don't search previously explored nodes or failed nodes
@@ -295,6 +335,35 @@ class MCTSProver:
             )
             self.check_invariants()
 
+    def _expand_node(self, search_node):
+        # Expand node
+        if isinstance(search_node.state, TacticState):
+            ts = search_node.state.pp
+        else:
+            ts = search_node.state.unsolved_tactic_state
+        suggestions = self._generate_tactics(ts)
+
+        # Try all tactics in order of descending logprob, and collect the results. Any
+        # new nodes are added to `self.nodes`, and edges are added to the result node.
+        # self._run_tactic implements backpropagation.
+        # for tactic, logprob in suggestions:
+        #     self.tasks.put((search_node, tactic, logprob))
+
+        results = [
+            self._run_tactic(search_node, tactic, logprob)
+            for tactic, logprob in suggestions
+        ]
+        # not isinstance is a hack for python classing... non internal nodes do not have parents
+        # simple fix for later TODO
+        results = filter(lambda edge: (not isinstance(edge.dst, InternalNode) or (edge.dst.parent == search_node)), results)
+
+        # Store the fixed out edges of this node, marking it as explored.
+        # This will trigger recursively recomputing tree statistics.
+        search_node.out_edges = list(results)
+        self.num_expansions += 1
+
+        return
+
     def _generate_tactics(self, ts: str) -> List[Tuple[str, float]]:
         t0 = time.monotonic()
 
@@ -317,29 +386,42 @@ class MCTSProver:
             num_samples=self.num_sampled_tactics,
         )
 
-        has_intro = False
-        has_by_contra = False
         self.actor_time += time.monotonic() - t0
-        new_suggestions = []
-        for tactic in suggestions:
-            try:
-                tac = tactic[0].split()[0]
-                if tac == "intro":
-                    has_intro = True 
-                elif tac == "by_contra" or tac == "by_contradiction":
-                    has_by_contra = True
-                else:
-                    new_suggestions.append(tactic)
-            except:
-                new_suggestions.append(tactic)
-        if has_intro:
-            new_suggestions.append(('intro', -1))
-        if has_by_contra:
-            new_suggestions.append(('by_contra', -1))
-        suggestions = new_suggestions
+        # has_intro = False
+        # has_by_contra = False
+        # new_suggestions = []
+        # for tactic in suggestions:
+        #     try:
+        #         tac = tactic[0].split()[0]
+        #         if tac == "intro":
+        #             has_intro = True 
+        #         elif tac == "by_contra" or tac == "by_contradiction":
+        #             has_by_contra = True
+        #         else:
+        #             new_suggestions.append(tactic)
+        #     except:
+        #         new_suggestions.append(tactic)
+        # if has_intro:
+        #     new_suggestions.append(('intro', -1))
+        # if has_by_contra:
+        #     new_suggestions.append(('by_contra', -1))
+        # suggestions = new_suggestions
 
         logger.debug(f"Tactic suggestions: {suggestions}")
         return suggestions
+
+    # def _parallel_run_tactics(self, search_node, suggestions):
+    #     args = []
+    #     i = 0
+    #     for suggestion in suggestions:
+    #         tactic, logprob = suggestion
+    #         args.append((self.dojos[i], search_node, tactic, logprob))
+    #         i += 1
+    #     
+    #     with Pool(5) as p:
+    #         print(args)
+    #         print(p.map(_parallel_run_tactic, args))
+
 
     def _run_tactic(self, node: InternalNode, tactic: str, logprob: float) -> Edge:
         t0 = time.monotonic()
@@ -348,6 +430,8 @@ class MCTSProver:
         elapsed = time.monotonic() - t0
         self.environment_time += elapsed
 
+        # print(type(response))
+        # print(response)
         is_new_node = False
 
         try:
@@ -366,12 +450,14 @@ class MCTSProver:
                 result_node = ErrorNode(response)
             else:
                 assert isinstance(response, TacticState)
+                # print(f'{response.pp.strip()}, {full/compressed}')
                 result_node = InternalNode(
                     state=response,
                     cumulative_logprob=logprob + node.cumulative_logprob,
                     depth=node.depth + 1,
                     parent=node,
-                    logprob=logprob
+                    logprob=logprob,
+                    ts_len=len(response.pp.strip()),
                 )
 
             if result_node.status == Status.OPEN:  # Don't search proved/failed nodes
@@ -457,7 +543,7 @@ class CpuProver(MCTSProver):
             debug,
         )
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=0.25)
 class GpuProver(MCTSProver):
     """Ray actor for running an instance of `MCTSProver` on a GPU."""
 
@@ -834,11 +920,11 @@ class DistributedProver:
             assert not tactic and not module
         self.distributed = num_cpus > 1
 
+        os.environ["CUDA_VISIBLE_DEVICES"] = "1"
         if not self.distributed:
             if ckpt_path is None:
                 tac_gen = FixedTacticGenerator(tactic, module)
             else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = "1"
                 device = torch.device("cuda") if with_gpus else torch.device("cpu")
                 tac_gen = RetrievalAugmentedGenerator.load(
                     ckpt_path, device=device, freeze=True

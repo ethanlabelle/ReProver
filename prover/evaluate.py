@@ -13,6 +13,7 @@ from lean_dojo import LeanGitRepo, Theorem, Pos, is_available_in_cache
 
 from common import set_logger
 from prover.proof_search import Status, DistributedProver
+import multiprocessing as mp
 
 
 def _get_theorems(
@@ -242,6 +243,8 @@ def main() -> None:
 
     logger.info(f"PID: {os.getpid()}")
     logger.info(args)
+
+    mp.set_start_method('spawn')
 
     pass_1 = evaluate(
         args.data_path,
